@@ -476,6 +476,15 @@ def main():
                         "0 (default value): dynamic loss scaling.\n"
                         "Positive power of 2: static loss scaling value.\n")
 
+    # Added parameters
+    parser.add_argument("--test_corpus",
+                        default=None,
+                        type=str,
+                        help="The input test corpus.")
+    parser.add_argument("--do_test",
+                        action='store_true',
+                        help="Whether to run testing.")
+
     args = parser.parse_args()
 
     if args.local_rank == -1 or args.no_cuda:
@@ -612,7 +621,37 @@ def main():
             logger.info("** ** * Saving fine - tuned model ** ** * ")
             model.save_pretrained(args.output_dir)
             tokenizer.save_pretrained(args.output_dir)
+        
+    if args.do_test:
+        test_dataset = BERTDataset(args.test_corpus, tokenizer, seq_len=args.max_seq_length,
+                                    corpus_lines=None, on_memory=args.on_memory)
+        test_batch_size = 1
+        logger.info("***** Running testing *****")
+        logger.info("  Num examples = %d", test_dataset.__len__())
+        logger.info("  Batch size = %d", test_batch_size)
 
+        if args.local_rank == -1:
+            test_sampler = RandomSampler(test_dataset)
+        else:
+            #TODO: check if this works with current data generator from disk that relies on next(file)
+            # (it doesn't return item back by index)
+            test_sampler = DistributedSampler(test_dataset)
+        test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=test_batch_size)
+        
+        # Print accuracy
+        total = 0
+        correct = 0
+        for step, batch in enumerate(tqdm(test_dataloader, desc="Iteration")):
+            batch = tuple(t.to(device) for t in batch)
+            input_ids, input_mask, segment_ids, lm_label_ids, is_next = batch
+            outputs = model(input_ids, segment_ids, input_mask, lm_label_ids, is_next)
+            # print(input_ids.shape)
+            # print(indices.shape, outputs[0].shape, lm_label_ids.shape)
+            batch_total, batch_correct = accuracy(outputs[1], lm_label_ids)
+            total += batch_total
+            correct += batch_correct
+
+        print("accuracy:", correct / total)
 
 def _truncate_seq_pair(tokens_a, tokens_b, max_length):
     """Truncates a sequence pair in place to the maximum length."""
@@ -632,8 +671,10 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
 
 
 def accuracy(out, labels):
-    outputs = np.argmax(out, axis=1)
-    return np.sum(outputs == labels)
+    indices = torch.nonzero(labels.view(-1) == -1).squeeze(1)
+    labels = labels.index_select(indices, 1).squeeze(0)
+    outputs = torch.argmax(out, 2).index_select(indices, 1).squeeze(0)
+    return indices.size(0), torch.sum(outputs == labels).item()
 
 
 if __name__ == "__main__":
