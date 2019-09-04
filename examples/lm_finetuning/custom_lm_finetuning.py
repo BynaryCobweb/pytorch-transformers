@@ -516,7 +516,7 @@ def main():
 
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
-    random.seed(args.seed)
+    #random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if n_gpu > 0:
@@ -583,8 +583,8 @@ def main():
                 optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
 
         else:
-            optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-        scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=num_train_optimization_steps)
+            optimizer = torch.optim.Adam(optimizer_grouped_parameters, lr=args.learning_rate)
+        # scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=num_train_optimization_steps)
 
     global_step = 0
     if args.do_train:
@@ -601,15 +601,18 @@ def main():
             train_sampler = DistributedSampler(train_dataset)
         train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
-        model.train()
+        model.eval()
         for _ in trange(int(args.num_train_epochs), desc="Epoch"):
             tr_loss = 0
             nb_tr_examples, nb_tr_steps = 0, 0
-            for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
+            for step, batch in enumerate(train_dataloader):
+                # batch = tuple(torch.cat([t] * args.train_batch_size, dim=0).to(device) for t in test_sentence(tokenizer))
                 batch = tuple(t.to(device) for t in batch)
                 input_ids, input_mask, segment_ids, lm_label_ids, is_next = batch
-                outputs = model(input_ids, segment_ids, input_mask, lm_label_ids)
-                loss = outputs[0]
+                outputs = model(input_ids, segment_ids, input_mask)
+                loss = torch.nn.functional.nll_loss(torch.nn.functional.log_softmax(
+                    outputs[0].view(-1, outputs[0].size(2)), dim=1),
+                    lm_label_ids.view(-1), ignore_index=-1, weight=None, reduction='mean')
                 if n_gpu > 1:
                     loss = loss.mean() # mean() to average on multi-gpu.
                 if args.gradient_accumulation_steps > 1:
@@ -622,7 +625,9 @@ def main():
                 nb_tr_examples += input_ids.size(0)
                 nb_tr_steps += 1
                 if (step + 1) % args.gradient_accumulation_steps == 0:
-                    scheduler.step()  # Update learning rate schedule
+                    print(tr_loss)
+                    tr_loss = 0
+                    # scheduler.step()  # Update learning rate schedule
                     optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
@@ -665,25 +670,27 @@ def main():
         print("accuracy:", correct / total)
 
     # Test sentence
+    batch = tuple(t.to(device) for t in test_sentence(tokenizer))
+    input_ids, input_mask, segment_ids, lm_label_ids, is_next = batch
+    outputs = model(input_ids, segment_ids, input_mask, lm_label_ids)
+    print("loss", outputs[0].item())
+
+def test_sentence(tokenizer):
     tokens = tokenizer.tokenize("Safety concerns stand in way of space tourism. Thrill seekers are plunking down six figures to ride rockets not even been built yet and a new airline called Virgin Galactic promises to be soaring in the next three years.")
     tokens = tokenizer.convert_tokens_to_ids(["[CLS]"] + tokens + ["[SEP]"])
     labels = [-1] * len(tokens)
     labels[5] = tokens[5]
     tokens[5] = 103
-    print(tokens)
 
-    input_ids = pad(torch.LongTensor(tokens).to(device), 512, 0).unsqueeze(0)
-    input_mask = pad(torch.ones(len(tokens), dtype=torch.long, device=device), 512, 0).unsqueeze(0)
-    segment_ids = torch.zeros(512, dtype=torch.long, device=device).unsqueeze(0)
-    lm_labels = pad(torch.LongTensor(labels).to(device), 512, -1).unsqueeze(0)
-
-    outputs = model(input_ids, segment_ids, input_mask)
-    print(outputs[0].max(2))
+    input_ids = pad(torch.LongTensor(tokens), 512, 0).unsqueeze(0)
+    input_mask = pad(torch.ones(len(tokens), dtype=torch.long), 512, 0).unsqueeze(0)
+    segment_ids = torch.zeros(512, dtype=torch.long).unsqueeze(0)
+    lm_labels = pad(torch.LongTensor(labels), 512, -1).unsqueeze(0)
+    return input_ids, input_mask, segment_ids, lm_labels, torch.LongTensor(0)
 
 def pad(tensor, count, val):
     pad_size = count - tensor.size(0)
-    return torch.nn.functional.pad(tensor, (0, pad_size))
-    
+    return torch.nn.functional.pad(tensor, (0, pad_size), value=val) 
 
 def _truncate_seq_pair(tokens_a, tokens_b, max_length):
     """Truncates a sequence pair in place to the maximum length."""
